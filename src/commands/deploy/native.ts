@@ -4,6 +4,7 @@ import fs from 'fs-extra'
 import inquirer from 'inquirer'
 import path from 'node:path'
 
+import {CloudConfigService} from '../../services/cloud-config.js'
 import {ConfigManager} from '../../utils/config.js'
 import {runBuildSteps, runCommand, uploadFile} from '../../utils/deploy-helpers.js'
 import VersionSync from '../version/sync.js'
@@ -11,15 +12,16 @@ import VersionSync from '../version/sync.js'
 export default class DeployNative extends Command {
   static description = 'Deploy a native update (APK/IPA)'
   static flags = {
-    environment: Flags.string({char: 'e', options: ['dev', 'staging', 'prod']}),
-    version: Flags.string({char: 'v', options: ['major', 'minor', 'patch']}),
-    platform: Flags.string({char: 'p', options: ['android', 'ios'], default: 'android'}),
+    active: Flags.boolean({allowNo: true, char: 'a', default: undefined}),
     channel: Flags.string({char: 'c'}),
-    note: Flags.string({char: 'n'}),
-    required: Flags.boolean({char: 'r', default: true, allowNo: true}),
-    active: Flags.boolean({char: 'a', default: true, allowNo: true}),
-    skipBuild: Flags.boolean({default: false}),
+    environment: Flags.string({char: 'e', default: undefined, options: ['dev', 'staging', 'prod']}),
+    flavor: Flags.string({char: 'f', description: 'Client/Flavor name (e.g. clientA)'}),
+    note: Flags.string({char: 'n', default: ''}),
+    platform: Flags.string({char: 'p', default: 'android', options: ['android', 'ios']}),
+    required: Flags.boolean({allowNo: true, char: 'r', default: undefined}),
     skipAsset: Flags.boolean({char: 's', default: false}),
+    skipBuild: Flags.boolean({default: false}),
+    version: Flags.string({char: 'v', default: undefined, options: ['major', 'minor', 'patch']}),
     yes: Flags.boolean({char: 'y', default: false}),
   }
 
@@ -27,34 +29,130 @@ export default class DeployNative extends Command {
     const {flags} = await this.parse(DeployNative)
     const root = process.cwd()
     const configManager = new ConfigManager(root)
-    const config = await configManager.loadConfig(flags)
+    const cloudService = new CloudConfigService(root)
 
-    let env = config.environment
-    if (!env) {
-      env = (
-        await inquirer.prompt([
+    // 1. Fetch Cloud Config
+    const cloudConfig = await cloudService.fetchProjectConfig()
+
+    let {environment, flavor, channel, active, required, note, version} = flags
+
+    // --- Interactive Wizard ---
+
+    // Flavor
+    if (!flavor) {
+      const cloudFlavors = cloudConfig?.flavors?.map((f) => f.name) || []
+      if (cloudFlavors.length > 0) {
+        const answers = await inquirer.prompt([
           {
             type: 'list',
-            name: 'environment',
-            message: 'Select environment:',
-            choices: ['dev', 'staging', 'prod'],
-            default: 'staging',
+            name: 'flavor',
+            message: 'Select Flavor:',
+            choices: ['(Default)', ...cloudFlavors],
+            default: '(Default)',
           },
         ])
-      ).environment
+        flavor = answers.flavor === '(Default)' ? undefined : answers.flavor
+      }
     }
 
-    // Resolve channel
-    const channelMap: Record<string, string> = {dev: 'development', staging: 'beta', prod: 'stable'}
-    const channel = config.channel || channelMap[env] || 'production'
+    // Environment
+    if (!environment) {
+      const config = await configManager.loadConfig({environment, flavor})
+      if (config.defaultEnvironment) {
+        environment = config.defaultEnvironment
+      } else {
+        const answers = await inquirer.prompt([
+          {
+            choices: ['dev', 'staging', 'prod'],
+            default: 'staging',
+            message: 'Select environment:',
+            name: 'environment',
+            type: 'list',
+          },
+        ])
+        environment = answers.environment
+      }
+    }
+    const env = environment! // Assert
 
-    if (!flags.yes) {
-      const {confirm} = await inquirer.prompt([
+    // Channel
+    if (!channel) {
+      const cloudChannels = cloudConfig?.channels?.map((c) => c.name) || [
+        'development',
+        'staging',
+        'production',
+        'beta',
+        'stable',
+      ]
+      const channelMap: Record<string, string> = {dev: 'development', prod: 'stable', staging: 'beta'}
+      const defaultChannel = channelMap[env] || 'production'
+
+      const answers = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'channel',
+          message: 'Select Channel:',
+          choices: Array.from(new Set([defaultChannel, ...cloudChannels])),
+          default: defaultChannel,
+        },
+      ])
+      channel = answers.channel
+    }
+
+    // Options
+    if (active === undefined && !flags.yes) {
+      const answers = await inquirer.prompt([
         {
           type: 'confirm',
-          name: 'confirm',
-          message: `Deploy NATIVE to ${env} (${flags.platform})?`,
+          name: 'active',
+          message: 'Activate immediately?',
           default: true,
+        },
+      ])
+      active = answers.active
+    } else if (active === undefined) active = true
+
+    if (required === undefined && !flags.yes) {
+      const answers = await inquirer.prompt([
+        {
+          type: 'confirm',
+          name: 'required',
+          message: 'Mark as required?',
+          default: true,
+        },
+      ])
+      required = answers.required
+    } else if (required === undefined) required = true
+
+    if (!version && !flags.yes) {
+      const answers = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'version',
+          message: 'Bump Version?',
+          choices: ['None', 'patch', 'minor', 'major'],
+          default: 'None',
+        },
+      ])
+      version = answers.version === 'None' ? undefined : answers.version
+    }
+
+    if (!flags.yes) {
+      this.log(chalk.cyan('-------------------------------------'))
+      this.log(`Environment: ${chalk.green(env)}`)
+      if (flavor) this.log(`Flavor:      ${chalk.green(flavor)}`)
+      this.log(`Channel:     ${chalk.green(channel)}`)
+      this.log(`Active:      ${active ? chalk.green('Yes') : chalk.red('No')}`)
+      this.log(`Required:    ${required ? chalk.green('Yes') : chalk.red('No')}`)
+      this.log(`Version Bump:${chalk.green(version || 'none')}`)
+      this.log(chalk.cyan('-------------------------------------'))
+
+      const {confirm} = await inquirer.prompt([
+        {
+          default: true,
+          message: `Deploy NATIVE to ${env} (${flags.platform})${flavor ? ` for ${flavor}` : ''}?`,
+          name: 'confirm',
+          type: 'confirm',
         },
       ])
       if (!confirm) return
@@ -62,16 +160,20 @@ export default class DeployNative extends Command {
 
     try {
       // Step 0: Version Bump & Sync
-      if (flags.version) {
+      if (version) {
         console.log(chalk.magenta(`[0] Bumping version (${flags.version})...`))
         runCommand(`npm version ${flags.version} --no-git-tag-version`, root)
       }
 
       console.log(chalk.green('[1] Syncing version...'))
-      await VersionSync.run(['--environment', env, ...(flags.version ? ['--bump'] : [])])
+      if (!env) {
+        this.error('Environment is undefined')
+        return
+      }
+      await VersionSync.run(['--environment', env, ...(version ? ['--bump'] : [])])
 
       // Reload config
-      const freshConfig = await configManager.loadConfig({...flags, environment: env})
+      const freshConfig = await configManager.loadConfig({...flags, environment: env, flavor})
       const appVersion = (await fs.readJson(path.join(root, 'package.json'))).version
       const versionCode = freshConfig.VERSION_CODE
       const apiUrl = freshConfig.VITE_UPDATE_API_URL || freshConfig.endpoint
@@ -82,12 +184,13 @@ export default class DeployNative extends Command {
       if (!flags.skipBuild) {
         await runBuildSteps(
           {
+            active: active!,
             env,
+            flavor: flavor,
             platform: flags.platform,
-            type: 'native',
+            required: required!,
             skipAsset: flags.skipAsset,
-            required: flags.required,
-            active: flags.active,
+            type: 'native',
           },
           root,
         )
@@ -100,7 +203,7 @@ export default class DeployNative extends Command {
       if (flags.platform === 'android') {
         const androidDir = path.join(root, 'android')
         const isWindows = process.platform === 'win32'
-        const gradleCmd = isWindows ? '.\\gradlew.bat' : './gradlew'
+        const gradleCmd = isWindows ? String.raw`.\gradlew.bat` : './gradlew'
         const assembleTask = env === 'prod' ? 'assembleRelease' : 'assembleDebug'
 
         runCommand(`${gradleCmd} ${assembleTask}`, androidDir)
@@ -124,17 +227,18 @@ export default class DeployNative extends Command {
         uploadUrl,
         filePath,
         {
-          fileField: 'file',
           fields: {
-            version: appVersion,
-            version_code: versionCode,
-            platform: flags.platform,
-            channel: channel,
+            active: active!.toString(),
+            channel: channel!,
             environment: env,
-            required: flags.required.toString(),
-            active: flags.active.toString(),
-            release_notes: flags.note,
+            flavor: flavor ?? '',
+            platform: flags.platform,
+            releaseNotes: note ?? '',
+            required: required!.toString(),
+            version: appVersion,
+            versionCode: versionCode ?? '',
           },
+          fileField: 'file',
         },
         freshConfig.apiKey,
       )
@@ -144,8 +248,9 @@ export default class DeployNative extends Command {
       } else {
         this.error(`Upload failed! HTTP ${result.status}`)
       }
-    } catch (e: any) {
-      this.error(e.message)
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      this.error(errorMessage)
     }
   }
 }

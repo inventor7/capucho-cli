@@ -1,5 +1,6 @@
 import {Command} from '@oclif/core'
 import chalk from 'chalk'
+
 import {ConfigManager} from '../../utils/config.js'
 
 export default class AuthLogout extends Command {

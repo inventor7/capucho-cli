@@ -1,40 +1,50 @@
-import {execSync} from 'child_process'
-import path from 'path'
-import fs from 'fs-extra'
 import axios from 'axios'
-import FormData from 'form-data'
 import chalk from 'chalk'
-import ora from 'ora'
+import FormData from 'form-data'
+import fs from 'fs-extra'
+import {execSync} from 'node:child_process'
+import path from 'node:path'
 
 export interface DeployConfig {
-  env: string
-  platform: string
-  type: 'ota' | 'native'
-  channel?: string
-  version?: string
-  note?: string
-  required: boolean
   active: boolean
+  channel?: string
+  env: string
+  flavor?: string
+  note?: string
+  platform: string
+  required: boolean
   skipAsset?: boolean
+  type: 'native' | 'ota'
+  version?: string
 }
 
 export function runCommand(cmd: string, cwd: string = process.cwd(), silent: boolean = false) {
   try {
     execSync(cmd, {
       cwd,
-      stdio: silent ? 'pipe' : 'inherit',
       encoding: 'utf8',
+      stdio: silent ? 'pipe' : 'inherit',
     })
-  } catch (error: any) {
+  } catch {
     if (!silent) {
       console.error(chalk.red(`Command failed: ${cmd}`))
     }
+
     throw new Error(`Command failed: ${cmd}`)
   }
 }
 
 export async function runBuildSteps(config: DeployConfig, root: string) {
-  const {env, platform, skipAsset} = config
+  const {env, flavor, platform, skipAsset} = config
+
+  // Construct paths for flavor if needed
+  let envPath = `build/${env}/.env.${env}`
+  let trapezePath = `build/${env}/trapeze.${env}.yaml`
+
+  if (flavor) {
+    envPath = `build/flavors/${flavor}/${env}/.env.${env}`
+    trapezePath = `build/flavors/${flavor}/${env}/trapeze.${env}.yaml`
+  }
 
   // Step 1.5: Asset Generation
   if (!skipAsset) {
@@ -43,13 +53,23 @@ export async function runBuildSteps(config: DeployConfig, root: string) {
   }
 
   // Step 2: Build
-  console.log(chalk.green(`[2] Building for ${env}...`))
-  // Check if script exists, fallback to vite build if not? NO, user has build scripts.
-  runCommand(`pnpm build:${env}`, root)
+  console.log(chalk.green(`[2] Building for ${env} ${flavor ? `(${flavor})` : ''}...`))
+
+  if (flavor) {
+    // Dynamic command for flavor
+    runCommand(`npx dotenv -e ${envPath} -- vite build`, root)
+  } else {
+    // Standard script
+    runCommand(`pnpm build:${env}`, root)
+  }
 
   // Step 3: Trapeze
   console.log(chalk.green(`[3] Running Trapeze...`))
-  runCommand(`pnpm trapeze:${env}`, root)
+  if (flavor) {
+    runCommand(`npx dotenv -e ${envPath} -- trapeze run ${trapezePath} -y`, root)
+  } else {
+    runCommand(`pnpm trapeze:${env}`, root)
+  }
 
   // Step 4: Capacitor Sync
   console.log(chalk.green(`[4] Syncing Capacitor...`))
@@ -70,7 +90,15 @@ export function findLatestZip(root: string) {
   return files[0] || null
 }
 
-export async function uploadFile(url: string, filePath: string, formDataFields: Record<string, any>, apiKey?: string) {
+export async function uploadFile(
+  url: string,
+  filePath: string,
+  formDataFields: {
+    fields: Record<string, boolean | number | string>
+    fileField?: string
+  },
+  apiKey?: string,
+) {
   const form = new FormData()
 
   // Add file
@@ -92,15 +120,18 @@ export async function uploadFile(url: string, filePath: string, formDataFields: 
   try {
     const response = await axios.post(url, form, {
       headers,
-      maxContentLength: Infinity,
       maxBodyLength: Infinity,
+      maxContentLength: Infinity,
     })
-    return {success: true, data: response.data, status: response.status}
-  } catch (error: any) {
+    return {data: response.data, status: response.status, success: true}
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    // Type assertion for axios error response
+    const axiosError = error as {response?: {data: unknown; status: number}}
     return {
+      data: axiosError.response?.data || errorMessage,
+      status: axiosError.response?.status || 0,
       success: false,
-      status: error.response?.status || 0,
-      data: error.response?.data || error.message,
     }
   }
 }

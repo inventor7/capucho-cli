@@ -1,36 +1,39 @@
 import {Command, Flags} from '@oclif/core'
-import {execSync} from 'child_process'
 import chalk from 'chalk'
+import {execSync} from 'node:child_process'
+
 import VersionSync from './sync.js'
 
+// @ts-ignore - oclif v4 has internal typing incompatibility issues with arg definitions
 export default class VersionBump extends Command {
-  static description = 'Bump version and sync to env files'
-
   static args = {
     type: {
-      name: 'type',
       description: 'Version bump type (major, minor, patch)',
-      required: true,
+      name: 'type',
       options: ['major', 'minor', 'patch'],
+      required: true,
     },
-  }
+  } as const
 
+  static description = 'Bump version and sync to env files'
   static flags = {
     'git-tag-version': Flags.boolean({
-      description: 'Create a git tag',
-      default: false, // Default to false as per legacy script behavior
       allowNo: true,
+      default: false, // Default to false as per legacy script behavior
+      description: 'Create a git tag',
     }),
   }
 
   async run(): Promise<void> {
+    // @ts-ignore - oclif typing issue with parse method
     const {args, flags} = await this.parse(VersionBump)
 
-    this.log(chalk.magenta(`[0] Bumping version (${args.type})...`))
+    const typedArgs = args as {type: string}
+    this.log(chalk.magenta(`[0] Bumping version (${typedArgs.type})...`))
 
     try {
       const gitTagFlag = flags['git-tag-version'] ? '' : '--no-git-tag-version'
-      execSync(`npm version ${args.type} ${gitTagFlag}`, {stdio: 'inherit', cwd: process.cwd()})
+      execSync(`npm version ${typedArgs.type} ${gitTagFlag}`, {cwd: process.cwd(), stdio: 'inherit'})
 
       // After bumping, run sync
       // We can invoke the command helper or run the logic.
@@ -51,8 +54,9 @@ export default class VersionBump extends Command {
 
       this.log(chalk.green('[1] Syncing version to env files...'))
       await VersionSync.run(['--bump']) // Sync all envs and bump codes
-    } catch (error: any) {
-      this.error(error.message)
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      this.error(errorMessage)
     }
   }
 }
