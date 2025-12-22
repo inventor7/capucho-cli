@@ -2,14 +2,14 @@ import axios from 'axios'
 import chalk from 'chalk'
 import FormData from 'form-data'
 import fs from 'fs-extra'
-import {execSync} from 'node:child_process'
+import {exec} from 'node:child_process'
 import path from 'node:path'
+import {promisify} from 'node:util'
 
 export interface DeployConfig {
   active: boolean
   channel?: string
   env: string
-  flavor?: string
   note?: string
   platform: string
   required: boolean
@@ -18,62 +18,102 @@ export interface DeployConfig {
   version?: string
 }
 
-export function runCommand(cmd: string, cwd: string = process.cwd(), silent: boolean = false) {
-  try {
-    execSync(cmd, {
-      cwd,
-      encoding: 'utf8',
-      stdio: silent ? 'pipe' : 'inherit',
-    })
-  } catch {
-    if (!silent) {
-      console.error(chalk.red(`Command failed: ${cmd}`))
-    }
+import ghpages from 'gh-pages'
 
-    throw new Error(`Command failed: ${cmd}`)
+import {MultiStepProgress} from './progress.js'
+
+const execAsync = promisify(exec)
+
+/**
+ * Runs a command and buffers output to a log file on failure.
+ */
+export async function runCommand(command: string, cwd: string, silent: boolean = true) {
+  let stdoutBuffer = ''
+  let stderrBuffer = ''
+
+  try {
+    const {stdout, stderr} = await execAsync(command, {cwd})
+    stdoutBuffer = stdout
+    stderrBuffer = stderr
+
+    if (!silent) {
+      console.log(stdout)
+    }
+  } catch (error: any) {
+    const fullLog = `
+========================================
+COMMAND: ${command}
+CWD: ${cwd}
+ERROR: ${error.message}
+----------------------------------------
+STDOUT:
+${error.stdout || stdoutBuffer}
+----------------------------------------
+STDERR:
+${error.stderr || stderrBuffer}
+========================================
+`
+    const logFile = path.join(process.cwd(), 'capucho-deploy.log')
+    fs.appendFileSync(logFile, fullLog)
+    throw error
   }
 }
 
-export async function runBuildSteps(config: DeployConfig, root: string) {
-  const {env, flavor, platform, skipAsset} = config
+export async function runBuildSteps(
+  config: DeployConfig,
+  root: string,
+  progress: MultiStepProgress,
+  startStep: number,
+  totalSteps: number,
+) {
+  const {env, platform, skipAsset} = config
 
-  // Construct paths for flavor if needed
-  let envPath = `build/${env}/.env.${env}`
-  let trapezePath = `build/${env}/trapeze.${env}.yaml`
-
-  if (flavor) {
-    envPath = `build/flavors/${flavor}/${env}/.env.${env}`
-    trapezePath = `build/flavors/${flavor}/${env}/trapeze.${env}.yaml`
-  }
-
-  // Step 1.5: Asset Generation
+  // Step 3: Asset Generation
+  progress.nextStep(`[3/${totalSteps}] Generating assets for ${env}...`)
   if (!skipAsset) {
-    console.log(chalk.green(`[1.5] Generating assets for ${env}...`))
-    runCommand(`npm run assets:${env}`, root)
-  }
-
-  // Step 2: Build
-  console.log(chalk.green(`[2] Building for ${env} ${flavor ? `(${flavor})` : ''}...`))
-
-  if (flavor) {
-    // Dynamic command for flavor
-    runCommand(`npx dotenv -e ${envPath} -- vite build`, root)
+    await runCommand(`npm run assets:${env}`, root, true)
   } else {
-    // Standard script
-    runCommand(`pnpm build:${env}`, root)
+    progress.updateMessage(`[3/${totalSteps}] Skipping assets...`)
   }
 
-  // Step 3: Trapeze
-  console.log(chalk.green(`[3] Running Trapeze...`))
-  if (flavor) {
-    runCommand(`npx dotenv -e ${envPath} -- trapeze run ${trapezePath} -y`, root)
-  } else {
-    runCommand(`pnpm trapeze:${env}`, root)
+  // Step 4: Build
+  progress.nextStep(`[4/${totalSteps}] Building for ${env}...`)
+  await runCommand(`pnpm build:${env}`, root, true)
+
+  // Step 5: Trapeze
+  progress.nextStep(`[5/${totalSteps}] Running Trapeze...`)
+  await runCommand(`pnpm trapeze:${env}`, root, true)
+
+  // Step 6: Capacitor Sync
+  progress.nextStep(`[6/${totalSteps}] Syncing Capacitor...`)
+  await runCommand(`npx cap sync ${platform}`, root, true)
+}
+
+/**
+ * Finds the APK artifact after build, searching in multiple paths if needed.
+ */
+export function findApk(androidDir: string, variant: 'debug' | 'release' = 'release'): string | null {
+  const variantPath = path.join(androidDir, 'app/build/outputs/apk', variant)
+
+  if (!fs.existsSync(variantPath)) return null
+
+  const files = fs.readdirSync(variantPath, {recursive: true}) as string[]
+  const apkFile = files.find((f) => f.endsWith('.apk') && !f.includes('androidTest'))
+
+  if (apkFile) {
+    return path.join(variantPath, apkFile)
   }
 
-  // Step 4: Capacitor Sync
-  console.log(chalk.green(`[4] Syncing Capacitor...`))
-  runCommand(`npx cap sync ${platform}`, root)
+  return null
+}
+
+export async function deployToGhPages(distDir: string, repo: string, branch: string = 'assets'): Promise<void> {
+  await ghpages.publish(distDir, {
+    branch,
+    repo,
+    message: `Auto-deploy assets: ${new Date().toISOString()}`,
+    dotfiles: true,
+  })
 }
 
 export function findLatestZip(root: string) {

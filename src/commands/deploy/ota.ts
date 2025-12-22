@@ -1,41 +1,36 @@
 import {Command, Flags} from '@oclif/core'
 import chalk from 'chalk'
 import fs from 'fs-extra'
-import inquirer from 'inquirer'
+import {select, confirm, input} from '@inquirer/prompts'
 import path from 'node:path'
+import ora from 'ora'
 
-import {CloudConfigService} from '../../services/cloud-config.js'
+import {AuthService} from '../../services/auth.service.js'
+import {CloudService} from '../../services/cloud.service.js'
 import {ConfigManager} from '../../utils/config.js'
-import {findLatestZip, runBuildSteps, runCommand, uploadFile} from '../../utils/deploy-helpers.js'
-import VersionSync from '../version/sync.js'
+import {deployToGhPages, findLatestZip, runBuildSteps, runCommand, uploadFile} from '../../utils/deploy-helpers.js'
+import {MultiStepProgress} from '../../utils/progress.js'
+import {syncVersion} from '../../utils/version.js'
 
 export default class DeployOta extends Command {
-  static description = 'Deploy an OTA update to your app'
+  static description = 'Deploy an OTA update to your project'
+
   static examples = [
-    '<%= config.bin %> <%= command.id %> -e staging -v patch',
-    '<%= config.bin %> <%= command.id %> --environment prod --version minor --note "Critical fix"',
+    '<%= config.bin %> <%= command.id %> -c staging -v patch',
+    '<%= config.bin %> <%= command.id %> --note "Critical fix"',
   ]
+
   static flags = {
     active: Flags.boolean({
       allowNo: true,
       char: 'a',
-      default: undefined, // Changed to undefined to allow prompt if missing
+      default: undefined,
       description: 'Activate update immediately',
     }),
     channel: Flags.string({
       char: 'c',
       description: 'Release channel',
       required: false,
-    }),
-    environment: Flags.string({
-      char: 'e',
-      description: 'Target environment',
-      options: ['dev', 'staging', 'prod'],
-      required: false,
-    }),
-    flavor: Flags.string({
-      char: 'f',
-      description: 'Client/Flavor name (e.g. clientA)',
     }),
     note: Flags.string({
       char: 'n',
@@ -63,6 +58,10 @@ export default class DeployOta extends Command {
       options: ['major', 'minor', 'patch'],
       required: false,
     }),
+    verbose: Flags.boolean({
+      description: 'Show detailed output from build steps',
+      default: false,
+    }),
     yes: Flags.boolean({
       char: 'y',
       default: false,
@@ -74,241 +73,175 @@ export default class DeployOta extends Command {
     const {flags} = await this.parse(DeployOta)
     const root = process.cwd()
     const configManager = new ConfigManager(root)
-    const cloudService = new CloudConfigService(root)
+    const cloudService = new CloudService(root)
+    const authService = new AuthService(root)
 
-    // 1. Fetch Cloud Config (Flavors, Channels)
-    // We try to fetch this even if flags are present, unless offline
-    const cloudConfig = await cloudService.fetchProjectConfig()
+    // 0. Check Project Initialization
+    const projectConfig = await cloudService.getProjectConfig()
+    if (!projectConfig) {
+      this.error(chalk.red('Project not initialized. Please run ') + chalk.cyan('capucho init') + chalk.red(' first.'))
+    }
 
-    let {environment, flavor, channel, active, required, note, version} = flags
+    // 1. Check Authentication
+    const {valid, user} = await authService.verifyCredentials()
+    if (!valid) {
+      this.error(chalk.red('Not authenticated. Please run ') + chalk.cyan('capucho auth login') + chalk.red(' first.'))
+    }
 
-    // --- Interactive Wizard (Cloud-First) ---
+    this.log('')
+    this.log(chalk.cyan('╔═══════════════════════════════════════════╗'))
+    this.log(chalk.cyan('║') + chalk.bold('        Capucho OTA Deployment              ') + chalk.cyan('║'))
+    this.log(chalk.cyan('╚═══════════════════════════════════════════╝'))
+    this.log(chalk.gray(`  Project: ${projectConfig.appName}`))
+    this.log(chalk.gray(`  User:    ${user?.email}`))
+    this.log('')
 
-    // A. Flavor Selection
-    if (!flavor) {
-      // Check if we have flavors in cloud config
-      const cloudFlavors = cloudConfig?.flavors?.map((f) => f.name) || []
+    let {channel, active, required, note, version, verbose} = flags
+    const {cloudAppId} = projectConfig
 
-      if (cloudFlavors.length > 0) {
-        const answers = await inquirer.prompt([
-          {
-            type: 'list',
-            name: 'flavor',
-            message: 'Select Flavor:',
-            choices: ['(Default)', ...cloudFlavors],
-            default: '(Default)',
-          },
-        ])
-        flavor = answers.flavor === '(Default)' ? undefined : answers.flavor
+    // --- Interactive Wizard ---
+
+    // B. Channel Selection
+    if (!channel) {
+      const channels = await cloudService.getChannels(cloudAppId)
+      if (channels.length > 0) {
+        channel = await select({
+          message: 'Select Channel:',
+          choices: channels.map((c) => ({name: c.name, value: c.name})),
+        })
+      } else {
+        channel = await input({
+          message: 'Enter Channel Name:',
+          default: 'production',
+        })
       }
     }
 
-    // B. Environment Selection
-    // Check if we already have config
-    const loadedConfig = await configManager.loadConfig({environment, flavor})
-    let env = environment || loadedConfig.defaultEnvironment
-
-    if (!env) {
-      const answers = await inquirer.prompt([
-        {
-          choices: ['dev', 'staging', 'prod'],
-          default: 'staging',
-          message: 'Select environment:',
-          name: 'environment',
-          type: 'list',
-        },
-      ])
-      env = answers.environment
-    }
-
-    // C. Channel Selection
-    if (!channel) {
-      // Filter channels from cloud config
-      const cloudChannels = cloudConfig?.channels?.map((c) => c.name) || [
-        'development',
-        'staging',
-        'production',
-        'beta',
-        'stable',
-      ]
-      const channelMap: Record<string, string> = {dev: 'development', prod: 'stable', staging: 'beta'}
-      const defaultChannel = channelMap[env!] || 'production'
-
-      const answers = await inquirer.prompt([
-        {
-          type: 'list',
-          name: 'channel',
-          message: 'Select Channel:',
-          choices: Array.from(new Set([defaultChannel, ...cloudChannels])),
-          default: defaultChannel,
-        },
-      ])
-      channel = answers.channel
-    }
-
-    // D. Options (Active/Required)
+    // C. Options (Active/Required)
     if (active === undefined && !flags.yes) {
-      const answers = await inquirer.prompt([
-        {
-          type: 'confirm',
-          name: 'active',
-          message: 'Activate immediately?',
-          default: true,
-        },
-      ])
-      active = answers.active
+      active = await confirm({
+        message: 'Activate immediately?',
+        default: true,
+      })
     } else if (active === undefined) {
       active = true
     }
 
     if (required === undefined && !flags.yes) {
-      const answers = await inquirer.prompt([
-        {
-          type: 'confirm',
-          name: 'required',
-          message: 'Mark as Required?',
-          default: true,
-        },
-      ])
-      required = answers.required
+      required = await confirm({
+        message: 'Mark as Required?',
+        default: true,
+      })
     } else if (required === undefined) {
       required = true
     }
 
-    // E. Version Bump
+    // D. Version Bump
     if (!version && !flags.yes) {
-      const answers = await inquirer.prompt([
-        {
-          type: 'list',
-          name: 'version',
-          message: 'Bump Version?',
-          choices: ['None', 'patch', 'minor', 'major'],
-          default: 'None',
-        },
-      ])
-      version = answers.version === 'None' ? undefined : answers.version
+      version = await select({
+        message: 'Bump Version?',
+        choices: [
+          {name: 'None', value: ''},
+          {name: 'patch', value: 'patch'},
+          {name: 'minor', value: 'minor'},
+          {name: 'major', value: 'major'},
+        ],
+        default: '',
+      })
     }
 
-    // --- Config Loading & Confirmation ---
+    // E. Release Notes
+    if (!note && !flags.yes) {
+      note = await input({
+        message: 'Release Notes (optional):',
+      })
+    }
 
-    // Final Config Load with resolved values
-    const config = await configManager.loadConfig({...flags, environment: env, flavor})
-
-    // Config confirm
+    // --- Confirmation ---
     if (!flags.yes) {
-      this.log(chalk.cyan('-------------------------------------'))
-      this.log(`Environment: ${chalk.green(env)}`)
-      if (flavor) this.log(`Flavor:      ${chalk.green(flavor)}`)
-      this.log(`Channel:     ${chalk.green(channel)}`)
-      this.log(`Active:      ${active ? chalk.green('Yes') : chalk.red('No')}`)
-      this.log(`Required:    ${required ? chalk.green('Yes') : chalk.red('No')}`)
-      this.log(`Version Bump:${chalk.green(version || 'none')}`)
-      this.log(chalk.cyan('-------------------------------------'))
+      this.log('')
+      this.log(chalk.cyan('─────────────────────────────────────────'))
+      this.log(`  App:         ${chalk.green(projectConfig.appName)}`)
+      this.log(`  Cloud ID:    ${chalk.gray(cloudAppId)}`)
+      this.log(`  Channel:     ${chalk.green(channel)}`)
+      this.log(`  Active:      ${active ? chalk.green('Yes') : chalk.red('No')}`)
+      this.log(`  Required:    ${required ? chalk.green('Yes') : chalk.red('No')}`)
+      this.log(`  Version:     ${chalk.green(version || 'no bump')}`)
+      this.log(chalk.cyan('─────────────────────────────────────────'))
+      this.log('')
 
-      const {confirm} = await inquirer.prompt([
-        {
-          default: true,
-          message: 'Ready to deploy?',
-          name: 'confirm',
-          type: 'confirm',
-        },
-      ])
-      if (!confirm) return
+      const shouldDeploy = await confirm({
+        message: 'Ready to deploy?',
+        default: true,
+      })
+      if (!shouldDeploy) return
     }
+
+    const progress = new MultiStepProgress()
 
     try {
-      // Step 0: Version Bump
+      const totalSteps = 9
+      progress.start(totalSteps, 'Initializing deployment...')
+
+      // Step 1: Version Bump
       if (version) {
-        // Re-run loadConfig after bumping? Handled by sync command inside bump.
-        // Using runCommand helper to invoke bump command logic
-        // But since VersionBump is an Oclif command, we can run it.
-        // However, arguments passing to run() is specific.
-        // Easier to just use our own helpers or shell out if we want clean separation.
-        // Let's shell out to ensure clean state or just use the logic directly.
-        // Actually, `npm version` is all we really need + sync.
-
-        // Replicating `deploy.js` logic which calls `npm version ...`
-        console.log(chalk.magenta(`[0] Bumping version (${flags.version})...`))
-        runCommand(`npm version ${flags.version} --no-git-tag-version`, root)
+        progress.updateMessage(`[1/${totalSteps}] Bumping version (${version})...`)
+        await runCommand(`npm version ${version} --no-git-tag-version`, root, true)
+      } else {
+        progress.updateMessage(`[1/${totalSteps}] Skipping version bump...`)
       }
 
-      // Step 1: Sync Version
-      console.log(chalk.green('[1] Syncing version to env files...'))
-      if (!env) {
-        this.error('Environment is undefined')
-        return
-      }
-      // We can run the sync command directly
-      await VersionSync.run(['--environment', env, ...(version ? ['--bump'] : [])])
+      // Step 2: Sync Version
+      progress.nextStep(`[2/${totalSteps}] Syncing version to project files...`)
+      const {version: appVersion} = await syncVersion(root, 'prod', !!version)
 
-      // RELOAD config to get new version codes from .env files (via ConfigManager legacy loader)
-      // Pass flavor so it loads correct .env
-      const freshConfig = await configManager.loadConfig({...flags, environment: env, flavor})
-      const appVersion = (await fs.readJson(path.join(root, 'package.json'))).version
-      // The VERSION_CODE should be in freshConfig if it parsed the env file correctly.
-      // Legacy deploy script reads it from .env. Let's assume ConfigManager loaded it.
-      const versionCode = freshConfig.VERSION_CODE || freshConfig.BUILD_NUMBER || '0'
-      const apiUrl = freshConfig.VITE_UPDATE_API_URL || freshConfig.endpoint
+      const freshConfig = await configManager.loadConfig()
+      const apiUrl = freshConfig.endpoint as string
 
-      if (!apiUrl) {
-        this.error('API URL not found in configuration or .env files!', {exit: 1})
-      }
-
-      // App ID logic
-      const appIdMap: Record<string, string> = {
-        dev: 'io.aybinv7.vuena.dev',
-        prod: 'io.aybinv7.vuena',
-        staging: 'io.aybinv7.vuena.staging',
-      }
-      if (!env) {
-        this.error('Environment is undefined')
-        return
-      }
-      let appId = config.appId
-        ? config.environments?.[env]?.appId || `${config.appId}${env === 'prod' ? '' : '.' + env}`
-        : appIdMap[env]
-
-      // If flavor is used, the App ID should ideally come from the loaded .env (VITE_APP_ID)
-      // ConfigManager loads .env into freshConfig.
-      // Let's check there first.
-      if (freshConfig.VITE_APP_ID && typeof freshConfig.VITE_APP_ID === 'string') {
-        appId = freshConfig.VITE_APP_ID
-      }
-
-      this.log('')
-      this.log(chalk.cyan(`Deploying v${appVersion} (${versionCode}) to ${env}...`))
-      this.log('')
-
-      // Build Steps (1.5 - 4)
+      // Step 3-6: Build Steps
       if (!flags.skipBuild) {
         await runBuildSteps(
           {
             active: active!,
-            env,
-            flavor,
-            platform: 'android', // Defaulting to android as per legacy script
+            env: 'prod',
+            platform: 'android',
             required: required!,
             skipAsset: flags.skipAsset,
             type: 'ota',
           },
           root,
+          progress,
+          3,
+          totalSteps,
         )
+      } else {
+        progress.updateMessage(`[3/${totalSteps}] Skipping build steps...`)
       }
 
-      // Step 5: Bundle (OTA specific)
-      console.log(chalk.green('[5] Creating OTA bundle...'))
-      // Using npx @capgo/cli directly
-      runCommand(`npx @capgo/cli bundle zip ${appId} --bundle ${appVersion} --json`, root, true)
+      // Step 7: Bundle (OTA specific)
+      progress.nextStep(`[7/${totalSteps}] Creating OTA bundle...`)
+      await runCommand(`npx @capgo/cli bundle zip ${projectConfig.appId} --bundle ${appVersion} --json`, root, true)
 
       const zipFile = findLatestZip(root)
       if (!zipFile) {
-        this.error('Bundle zip not created!')
+        throw new Error('Bundle zip not created!')
       }
 
-      this.log(chalk.gray(`  Bundle: ${zipFile.name}`))
+      // Step 8: Deploy Assets to GH Pages
+      progress.nextStep(`[8/${totalSteps}] Deploying assets to GitHub Pages...`)
+      if (!flags.skipAsset) {
+        try {
+          const repoUrl = projectConfig.ghPagesRepo || 'https://github.com/inventor7/Vuena.git'
+          await deployToGhPages(path.join(root, 'dist'), repoUrl)
+        } catch (err) {
+          this.warn('Failed to deploy assets to GitHub Pages. Continuing with OTA...')
+        }
+      } else {
+        progress.updateMessage(`[8/${totalSteps}] Skipping asset deployment...`)
+      }
 
-      // Step 6: Upload
-      console.log(chalk.green('[6] Uploading OTA bundle...'))
+      // Step 9: Upload to Capucho Cloud
+      progress.nextStep(`[9/${totalSteps}] Uploading OTA bundle to cloud...`)
       const uploadUrl = `${apiUrl}/api/admin/upload`
 
       const result = await uploadFile(
@@ -317,30 +250,38 @@ export default class DeployOta extends Command {
         {
           fields: {
             active: active!.toString(),
+            app_id: projectConfig.appId,
             channel: channel!,
-            environment: env,
-            flavor: flavor ?? '',
-            platform: 'android', // TODO: Make configurable
-            releaseNotes: note ?? '',
+            platform: 'android',
+            release_notes: note ?? '',
             required: required!.toString(),
-            version: appVersion,
+            version_name: appVersion,
           },
-          fileField: 'bundle',
+          fileField: 'file',
         },
-        freshConfig.apiKey,
+        freshConfig.apiKey as string,
       )
 
       if (result.success || (result.data && result.data.success)) {
-        // Handle bad status but success body
-        this.log(chalk.green(`  Upload successful!`))
+        progress.finish(`Successfully deployed v${appVersion} to '${channel}'!`)
         fs.unlinkSync(zipFile.path)
-        this.log(chalk.gray(`  Cleaned up: ${zipFile.name}`))
       } else {
-        this.error(`Upload failed! HTTP ${result.status} - ${JSON.stringify(result.data)}`)
+        progress.fail('Upload failed')
+        this.log(chalk.red(`\n  Server responded with: ${JSON.stringify(result.data)}\n`))
+        return
       }
+
+      // Success!
+      this.log('')
+      this.log(chalk.green('╔═══════════════════════════════════════════╗'))
+      this.log(chalk.green('║') + chalk.bold('        Deployment Complete! 🚀            ') + chalk.green('║'))
+      this.log(chalk.green('╚═══════════════════════════════════════════╝'))
+      this.log(chalk.cyan(`  ${projectConfig.appName} v${appVersion} → '${channel}'`))
+      this.log('')
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      this.error(errorMessage)
+      progress.fail(`Deployment failed: ${errorMessage}`)
+      this.error(chalk.red('\n  See capucho-deploy.log for more details.\n'))
     }
   }
 }

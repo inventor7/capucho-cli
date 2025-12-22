@@ -9,9 +9,18 @@ export interface CapuchoConfig {
   apiKey?: string
   appId?: string
   appName?: string
+  apps?: Array<{
+    app_id: string
+    icon_url?: string
+    id: string
+    name: string
+    organization_id: string
+    role: string
+  }>
   authenticatedAt?: string
   BUILD_NUMBER?: string
   channel?: string
+  defaultAppId?: string
   defaultEnvironment?: string
   endpoint?: string
   environment?: string
@@ -20,23 +29,25 @@ export interface CapuchoConfig {
   gitTagVersion?: boolean
   note?: string
   organization?: {name: string}
+  organizations?: Array<{
+    id: string
+    name: string
+    role: string
+    slug: string
+  }>
   required?: boolean
   skipAsset?: boolean
   skipBuild?: boolean
-  user?: {email: string; role: string}
+  user?: {email: string; id?: string; role?: string}
   version?: string
   VERSION_CODE?: string
+  VITE_APP_ID?: string
   VITE_UPDATE_API_URL?: string
   yes?: boolean
 }
 
 const CONFIG_DIR_NAME = '.capucho'
 const CONFIG_FILE_NAME = 'config.json'
-const LEGACY_ENV_MAP: Record<string, string> = {
-  dev: 'build/dev/.env.dev',
-  prod: 'build/prod/.env.prod',
-  staging: 'build/staging/.env.staging',
-}
 
 export class ConfigManager {
   private projectRoot: string
@@ -45,36 +56,29 @@ export class ConfigManager {
     this.projectRoot = projectRoot
   }
 
-  // Get global config path
+  // Get global config path (~/.capucho/config.json)
   public getGlobalConfigPath(): string {
     return path.join(os.homedir(), CONFIG_DIR_NAME, CONFIG_FILE_NAME)
   }
 
-  // Get project-specific config path
+  // Get project-specific config path (.capucho/project.json)
+  // We rename this to project.json for clarity
   public getProjectConfigPath(): string {
-    return path.join(this.projectRoot, CONFIG_DIR_NAME, CONFIG_FILE_NAME)
+    return path.join(this.projectRoot, CONFIG_DIR_NAME, 'project.json')
   }
 
   // Load configuration with precedence:
   // 1. Flags (passed as arg)
-  // 2. Legacy .env (if environment flag is set)
-  // 3. Project Config
-  // 4. Global Config
+  // 2. Project Config (.capucho/project.json)
+  // 3. Global Config (~/.capucho/config.json)
   public async loadConfig(flags: Partial<CapuchoConfig> = {}): Promise<CapuchoConfig> {
     const globalConfig = await this.readJsonFile(this.getGlobalConfigPath())
     const projectConfig = await this.readJsonFile(this.getProjectConfigPath())
 
-    let legacyConfig = {}
-    if (flags.environment) {
-      legacyConfig = await this.loadLegacyEnv(flags.environment, flags.flavor)
-    }
-
-    // Merge in reverse order of precedence (base is empty)
     return {
       ...globalConfig,
       ...projectConfig,
-      ...legacyConfig,
-      ...flags, // Flags overwrite everything
+      ...flags,
     }
   }
 
@@ -90,45 +94,6 @@ export class ConfigManager {
     const config = await this.readJsonFile(configPath)
     config[key] = value
     await fs.outputJson(configPath, config, {spaces: 2})
-  }
-
-  // Load legacy .env file based on environment and optional flavor
-  private async loadLegacyEnv(env: string, flavor?: string): Promise<CapuchoConfig> {
-    let relativePath = LEGACY_ENV_MAP[env]
-
-    if (flavor && relativePath) {
-      // Re-route to flavor path: build/flavors/<flavor>/<env>/.env.<env>
-      const envFileName = path.basename(relativePath)
-      relativePath = path.join('build', 'flavors', flavor, env, envFileName)
-    }
-
-    if (!relativePath) return {}
-
-    // Check both current dir and parent dir (in case running from cli folder)
-    let envPath = path.join(this.projectRoot, relativePath)
-    if (!(await fs.pathExists(envPath))) {
-      // Try parent directory if we are inside a subfolder (like capucho-cli)
-      envPath = path.join(this.projectRoot, '..', relativePath)
-    }
-
-    if (await fs.pathExists(envPath)) {
-      const envContent = await fs.readFile(envPath, 'utf8')
-      const parsed = dotenv.parse(envContent)
-
-      // Map legacy env vars to config keys if needed
-      // Currently just returning them as is, but specific keys might need mapping
-      const config: CapuchoConfig = {}
-
-      if (parsed.VITE_UPDATE_API_URL) {
-        // Can map this to an 'endpoint' config if we want
-        // config.endpoint = parsed.VITE_UPDATE_API_URL;
-      }
-
-      // We also return the raw parsed env vars so commands can look them up
-      return {...config, ...parsed}
-    }
-
-    return {}
   }
 
   // Read a JSON file safely
