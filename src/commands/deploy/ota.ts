@@ -48,6 +48,11 @@ export default class DeployOta extends Command {
       default: false,
       description: 'Skip asset generation',
     }),
+    generic: Flags.boolean({
+      char: 'g',
+      default: false,
+      description: 'Build a generic bundle (no embedded env)',
+    }),
     skipBuild: Flags.boolean({
       default: false,
       description: 'Skip build step',
@@ -96,8 +101,9 @@ export default class DeployOta extends Command {
     this.log(chalk.gray(`  User:    ${user?.email}`))
     this.log('')
 
-    let {channel, active, required, note, version, verbose} = flags
+    let {channel, active, required, note, version, verbose, generic} = flags
     const {cloudAppId} = projectConfig
+    const env = generic ? 'generic' : 'prod'
 
     // --- Interactive Wizard ---
 
@@ -157,6 +163,14 @@ export default class DeployOta extends Command {
       })
     }
 
+    // F. Generic Build
+    if (generic === false && !flags.yes) {
+      generic = await confirm({
+        message: 'Build a generic bundle (no embedded env)?',
+        default: false,
+      })
+    }
+
     // --- Confirmation ---
     if (!flags.yes) {
       this.log('')
@@ -167,6 +181,7 @@ export default class DeployOta extends Command {
       this.log(`  Active:      ${active ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(`  Required:    ${required ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(`  Version:     ${chalk.green(version || 'no bump')}`)
+      this.log(`  Generic:     ${generic ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(chalk.cyan('─────────────────────────────────────────'))
       this.log('')
 
@@ -193,7 +208,7 @@ export default class DeployOta extends Command {
 
       // Step 2: Sync Version
       progress.nextStep(`[2/${totalSteps}] Syncing version to project files...`)
-      const {version: appVersion} = await syncVersion(root, 'prod', !!version)
+      const {version: appVersion} = await syncVersion(root, env, !!version)
 
       const freshConfig = await configManager.loadConfig()
       const apiUrl = freshConfig.endpoint as string
@@ -203,7 +218,7 @@ export default class DeployOta extends Command {
         await runBuildSteps(
           {
             active: active!,
-            env: 'prod',
+            env,
             platform: 'android',
             required: required!,
             skipAsset: flags.skipAsset,
@@ -257,7 +272,7 @@ export default class DeployOta extends Command {
             required: required!.toString(),
             version_name: appVersion,
           },
-          fileField: 'file',
+          fileField: 'bundle',
         },
         freshConfig.apiKey as string,
       )
