@@ -14,8 +14,7 @@ export class ChannelService {
     const apiKey = config.apiKey
 
     if (!endpoint || !apiKey) {
-      // Fallback to defaults if no API access
-      return ['development', 'staging', 'production', 'beta', 'stable']
+      return ['dev', 'staging', 'prod']
     }
 
     try {

@@ -53,15 +53,15 @@ export default class ConfigInit extends Command {
       environments: {
         dev: {
           appId: `${answers.appId}.dev`,
-          channel: 'development',
+          channel: 'dev',
         },
         prod: {
           appId: answers.appId,
-          channel: 'stable',
+          channel: 'prod',
         },
         staging: {
           appId: `${answers.appId}.staging`,
-          channel: 'beta',
+          channel: 'staging',
         },
       },
       platforms: answers.platforms,
