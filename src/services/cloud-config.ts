@@ -9,6 +9,7 @@ export interface CloudChannel {
   id: string
   name: string
   public: boolean
+  environment: 'prod' | 'staging' | 'dev'
 }
 
 export interface CloudFlavor {

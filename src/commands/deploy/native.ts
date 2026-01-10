@@ -72,17 +72,17 @@ export default class DeployNative extends Command {
 
     let {channel, active, required, note, version, type} = flags
     const {cloudAppId} = projectConfig
-    const env = 'prod'
+    let selectedChannelEnv: 'prod' | 'staging' | 'dev' = 'staging'
 
     // --- Interactive Wizard ---
 
     // B. Channel Selection
+    const channels = await cloudService.getChannels(cloudAppId)
     if (!channel) {
-      const channels = await cloudService.getChannels(cloudAppId)
       if (channels.length > 0) {
         channel = await select({
           message: 'Select Channel:',
-          choices: channels.map((c) => ({name: c.name, value: c.name})),
+          choices: channels.map((c) => ({name: `${c.name} (${c.environment})`, value: c.name})),
         })
       } else {
         channel = await input({
@@ -91,6 +91,17 @@ export default class DeployNative extends Command {
         })
       }
     }
+
+    // Resolve channel environment
+    const selectedChannel = channels.find((c) => c.name === channel)
+    if (!selectedChannel) {
+      this.error(chalk.red(`Channel '${channel}' not found in cloud. Please create it first in the dashboard.`))
+    }
+    if (!selectedChannel.environment) {
+      this.error(chalk.red(`Channel '${channel}' has no environment configured. Please set it in the dashboard.`))
+    }
+    selectedChannelEnv = selectedChannel.environment
+    const env = selectedChannelEnv
 
     // C. Options (Active/Required)
     if (active === undefined && !flags.yes) {

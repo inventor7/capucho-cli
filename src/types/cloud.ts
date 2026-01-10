@@ -12,6 +12,7 @@ export interface CloudChannel {
   name: string
   public: boolean
   app_id: string
+  environment: 'prod' | 'staging' | 'dev'
   created_at: string
 }
 
