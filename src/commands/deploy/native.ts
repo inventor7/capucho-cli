@@ -32,7 +32,6 @@ export default class DeployNative extends Command {
     }),
     required: Flags.boolean({allowNo: true, char: 'r', default: undefined, description: 'Mark as required update'}),
     skipAsset: Flags.boolean({char: 's', default: false, description: 'Skip asset generation'}),
-    generic: Flags.boolean({char: 'g', default: false, description: 'Build a generic bundle (no embedded env)'}),
     skipBuild: Flags.boolean({default: false, description: 'Skip build step'}),
     version: Flags.string({
       char: 'v',
@@ -71,9 +70,9 @@ export default class DeployNative extends Command {
     this.log(chalk.gray(`  User:    ${user?.email}`))
     this.log('')
 
-    let {channel, active, required, note, version, type, generic} = flags
+    let {channel, active, required, note, version, type} = flags
     const {cloudAppId} = projectConfig
-    const env = generic ? 'generic' : 'prod'
+    const env = 'prod'
 
     // --- Interactive Wizard ---
 
@@ -143,14 +142,6 @@ export default class DeployNative extends Command {
       })
     }
 
-    // G. Generic Build
-    if (generic === false && !flags.yes) {
-      generic = await confirm({
-        message: 'Build a generic bundle (no embedded env)?',
-        default: false,
-      })
-    }
-
     // Confirmation
     if (!flags.yes) {
       this.log('')
@@ -162,7 +153,6 @@ export default class DeployNative extends Command {
       this.log(`  Active:      ${active ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(`  Required:    ${required ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(`  Version:     ${chalk.green(version || 'no bump')}`)
-      this.log(`  Generic:     ${generic ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(chalk.cyan('─────────────────────────────────────────'))
       this.log('')
 

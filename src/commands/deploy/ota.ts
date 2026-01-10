@@ -48,11 +48,6 @@ export default class DeployOta extends Command {
       default: false,
       description: 'Skip asset generation',
     }),
-    generic: Flags.boolean({
-      char: 'g',
-      default: false,
-      description: 'Build a generic bundle (no embedded env)',
-    }),
     skipBuild: Flags.boolean({
       default: false,
       description: 'Skip build step',
@@ -101,9 +96,9 @@ export default class DeployOta extends Command {
     this.log(chalk.gray(`  User:    ${user?.email}`))
     this.log('')
 
-    let {channel, active, required, note, version, verbose, generic} = flags
+    let {channel, active, required, note, version, verbose} = flags
     const {cloudAppId} = projectConfig
-    const env = generic ? 'generic' : 'prod'
+    const env = 'prod'
 
     // --- Interactive Wizard ---
 
@@ -163,14 +158,6 @@ export default class DeployOta extends Command {
       })
     }
 
-    // F. Generic Build
-    if (generic === false && !flags.yes) {
-      generic = await confirm({
-        message: 'Build a generic bundle (no embedded env)?',
-        default: false,
-      })
-    }
-
     // --- Confirmation ---
     if (!flags.yes) {
       this.log('')
@@ -181,7 +168,6 @@ export default class DeployOta extends Command {
       this.log(`  Active:      ${active ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(`  Required:    ${required ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(`  Version:     ${chalk.green(version || 'no bump')}`)
-      this.log(`  Generic:     ${generic ? chalk.green('Yes') : chalk.red('No')}`)
       this.log(chalk.cyan('─────────────────────────────────────────'))
       this.log('')
 
